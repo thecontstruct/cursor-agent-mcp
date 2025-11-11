@@ -343,9 +343,71 @@ Key entry points:
 
 ## Security notes
 
-- Child processes are spawned with `shell: false` to avoid shell injection and quoting issues.
-- Inputs are validated with Zod; unknown types are rejected.
-- Avoid logging secrets; DEBUG only prints argv and minimal env context.
+The MCP server implements multiple layers of security to prevent common attack vectors:
+
+### Process Execution Security
+
+- **Shell injection prevention**: Child processes are spawned with `shell: false` to avoid shell injection and quoting issues. Arguments are passed as arrays, not command strings.
+- **Executable path validation**: The `executable` parameter is strictly validated:
+  - Only allows `"cursor-agent"` (for PATH lookup)
+  - Only allows exact match to `CURSOR_AGENT_PATH` environment variable
+  - Rejects all other paths, including path traversal attempts (`..`, `/`, etc.)
+  - Prevents arbitrary command execution
+
+### Path Security
+
+- **Working directory restrictions**: The `cwd` parameter is validated to ensure:
+  - Working directory must be within `process.cwd()` or its subdirectories
+  - Path traversal attempts (`..`) are detected and rejected
+  - Paths are normalized and resolved before validation
+- **File path validation**: File paths in `cursor_agent_edit_file` and `cursor_agent_analyze_files` are validated:
+  - All paths must be within the project directory tree
+  - Path traversal attacks are prevented
+  - Paths are normalized before use
+
+### Environment Variable Security
+
+- **Whitelist-based filtering**: Only safe environment variables are passed to child processes:
+  - System variables: `PATH`, `HOME`, `USER`, `USERNAME`, `SHELL`, `TMPDIR`, `TEMP`, `TMP`
+  - Node.js variables: `NODE_VERSION`, `NPM_CONFIG_*`
+  - Cursor agent variables: `CURSOR_AGENT_*` (all variants)
+  - Locale variables: `LANG`, `LANGUAGE`, `LC_*`
+- **Credential protection**: Sensitive environment variables (API keys, passwords, tokens, secrets) are automatically excluded to prevent credential leakage
+
+### Input Validation
+
+- **Schema validation**: All inputs are validated with Zod schemas; unknown types are rejected.
+- **Type safety**: Strict type checking prevents injection of unexpected data types.
+
+### Logging Security
+
+- **Secret protection**: DEBUG mode only prints argv and minimal env context. Avoid logging secrets; sensitive data is never logged.
+- **Error messages**: Error messages are user-friendly but don't expose internal implementation details.
+
+### Security Configuration
+
+To maximize security:
+
+1. **Set CURSOR_AGENT_PATH**: Use an absolute path to the cursor-agent executable rather than relying on PATH:
+   ```json
+   "env": {
+     "CURSOR_AGENT_PATH": "/absolute/path/to/cursor-agent"
+   }
+   ```
+
+2. **Restrict working directory**: The server automatically restricts `cwd` to the project directory. Ensure the MCP server is started from the correct directory.
+
+3. **Minimize environment variables**: Only set necessary `CURSOR_AGENT_*` environment variables. Other sensitive vars are automatically filtered.
+
+4. **Use trusted cursor-agent**: Ensure the `cursor-agent` CLI itself is secure and up-to-date, as the server relies on its security.
+
+### Security Considerations
+
+- The server is designed for trusted environments (MCP hosts with trusted users/applications)
+- File operations are restricted to the project directory tree
+- Command execution is limited to the validated cursor-agent executable
+- Environment variable filtering prevents accidental credential exposure
+- All user-controlled paths are validated before use
 
 
 ## Versioning
