@@ -341,11 +341,24 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
  const envForce = env.CURSOR_AGENT_FORCE;
  const effectiveForce = typeof force === 'boolean' ? force : envForce;
 
+ // Extract prompt (last non-flag argument) to ensure it's the final argument
+ let promptArg = null;
+ let argsWithoutPrompt = userArgs;
+ if (userArgs.length > 0) {
+   const lastArg = userArgs[userArgs.length - 1];
+   // If last argument doesn't start with '-', treat it as the prompt
+   if (lastArg && typeof lastArg === 'string' && !lastArg.startsWith('-')) {
+     promptArg = lastArg;
+     argsWithoutPrompt = userArgs.slice(0, -1);
+   }
+ }
+
  const finalArgv = [
    ...(print ? ['--print', '--output-format', output_format] : []),
-   ...userArgs,
+   ...argsWithoutPrompt,
    ...(hasForceFlag || !effectiveForce ? [] : ['-f']),
-   ...(hasModelFlag || !effectiveModel ? [] : ['-m', effectiveModel]),
+   ...(hasModelFlag || !effectiveModel ? [] : ['--model', effectiveModel]),
+   ...(promptArg ? [promptArg] : []),
  ];
 
  return new Promise((resolve) => {

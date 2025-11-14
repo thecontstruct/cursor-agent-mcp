@@ -5,7 +5,7 @@ import {
   validateWorkingDirectory,
   validateFilePath,
   getSafeEnvironment,
-} from './server.js';
+} from '../server.js';
 
 describe('validateExecutablePath', () => {
   const originalEnv = process.env.CURSOR_AGENT_PATH;

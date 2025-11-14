@@ -240,7 +240,7 @@ describe('runCursorAgent', () => {
   });
 
   it('should call invokeCursorAgent with correct arguments', async () => {
-    const mockProcess = createMockChildProcess({ stdout: 'output', exitCode: 0 });
+    const mockProcess = createMockChildProcess({ stdout: 'output', exitCode: 0, force: true, model: 'gpt-5.1' });
     vi.mocked(spawn).mockReturnValue(mockProcess);
 
     await runCursorAgent({ prompt: 'test prompt', output_format: 'text' });
