@@ -324,8 +324,9 @@ function resolveExecutable(explicit) {
 /**
 * Internal executor that spawns cursor-agent with provided argv and common options.
 * Adds --print and --output-format, handles env/model/force, timeouts and idle kill.
+* Supports progress notifications when onProgress callback is provided.
 */
-async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable, model, force, print = true }) {
+async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable, model, force, print = true, onProgress }) {
  const cmd = resolveExecutable(executable);
  const validatedCwd = validateWorkingDirectory(cwd);
  const safeEnv = getSafeEnvironment();
@@ -353,8 +354,13 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
    }
  }
 
+ // If progress is requested, use stream-json format for parsing
+ const useStreamJson = !!onProgress;
+ const finalOutputFormat = useStreamJson ? 'stream-json' : output_format;
+
  const finalArgv = [
-   ...(print ? ['--print', '--output-format', output_format] : []),
+   ...(print ? ['--print', '--output-format', finalOutputFormat] : []),
+   ...(useStreamJson && print ? ['--stream-partial-output'] : []), // Enable incremental deltas
    ...argsWithoutPrompt,
    ...(hasForceFlag || !effectiveForce ? [] : ['-f']),
    ...(hasModelFlag || !effectiveModel ? [] : ['--model', effectiveModel]),
@@ -367,6 +373,11 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
    let err = '';
    let idleTimer = null;
    let killedByIdle = false;
+
+   // State for stream-json parsing
+   let accumulatedText = '';
+   let toolCount = 0;
+   let partialLine = ''; // Buffer for incomplete JSON lines
 
    const cleanup = () => {
      if (mainTimer) clearTimeout(mainTimer);
@@ -398,13 +409,147 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
      }, idleMs);
    };
 
+   // Helper to handle stream-json events
+   const handleStreamEvent = (event) => {
+     if (!onProgress || !event || typeof event !== 'object') return;
+
+     const { type, subtype } = event;
+
+     try {
+       switch (type) {
+         case 'system':
+           if (subtype === 'init') {
+             const modelName = event.model || 'unknown';
+             onProgress({
+               progress: 0,
+               message: `Initializing cursor-agent (model: ${modelName})...`
+             });
+           }
+           break;
+
+         case 'assistant':
+           // Accumulate text deltas from streaming output
+           const text = event.message?.content?.[0]?.text || '';
+           if (text) {
+             accumulatedText += text;
+             onProgress({
+               progress: accumulatedText.length,
+               message: `Generating response... (${accumulatedText.length} characters)`
+             });
+           }
+           break;
+
+         case 'tool_call':
+           if (subtype === 'started') {
+             toolCount++;
+             const toolCall = event.tool_call;
+
+             if (toolCall?.writeToolCall) {
+               const path = toolCall.writeToolCall?.args?.path || 'unknown';
+               onProgress({
+                 progress: toolCount,
+                 message: `Writing file: ${path}`
+               });
+             } else if (toolCall?.readToolCall) {
+               const path = toolCall.readToolCall?.args?.path || 'unknown';
+               onProgress({
+                 progress: toolCount,
+                 message: `Reading file: ${path}`
+               });
+             } else {
+               // Generic tool call
+               onProgress({
+                 progress: toolCount,
+                 message: `Executing tool #${toolCount}...`
+               });
+             }
+           } else if (subtype === 'completed') {
+             const toolCall = event.tool_call;
+
+             if (toolCall?.writeToolCall?.result?.success) {
+               const { linesCreated, fileSize } = toolCall.writeToolCall.result.success;
+               onProgress({
+                 progress: toolCount,
+                 message: `✅ Created ${linesCreated || 0} lines (${fileSize || 0} bytes)`
+               });
+             } else if (toolCall?.readToolCall?.result?.success) {
+               const { totalLines } = toolCall.readToolCall.result.success;
+               onProgress({
+                 progress: toolCount,
+                 message: `✅ Read ${totalLines || 0} lines`
+               });
+             } else if (toolCall?.writeToolCall?.result || toolCall?.readToolCall?.result) {
+               // Tool completed but might have error - still report completion
+               onProgress({
+                 progress: toolCount,
+                 message: `✅ Tool #${toolCount} completed`
+               });
+             }
+           }
+           break;
+
+         case 'result':
+           const duration = event.duration_ms || 0;
+           onProgress({
+             progress: 100,
+             total: 100,
+             message: `Completed in ${duration}ms`
+           });
+           break;
+       }
+     } catch (e) {
+       // Silently ignore errors in progress handling to avoid breaking the main flow
+       if (debugEnv2.DEBUG_CURSOR_MCP) {
+         try {
+           console.error('[cursor-mcp] progress error:', e);
+         } catch {}
+       }
+     }
+   };
+
    child.stdout.on('data', (d) => {
-     out += d.toString();
+     const chunk = d.toString();
+     out += chunk;
      scheduleIdleKill();
+
+     if (useStreamJson && onProgress) {
+       // Parse JSON lines from stream-json output
+       const data = partialLine + chunk;
+       const lines = data.split('\n');
+
+       // Keep the last line as it might be incomplete
+       partialLine = lines.pop() || '';
+
+       // Process complete lines
+       for (const line of lines) {
+         const trimmed = line.trim();
+         if (!trimmed) continue;
+
+         try {
+           const event = JSON.parse(trimmed);
+           handleStreamEvent(event);
+         } catch (e) {
+           // Not valid JSON - might be partial or malformed, skip it
+           if (debugEnv2.DEBUG_CURSOR_MCP) {
+             try {
+               console.error('[cursor-mcp] failed to parse JSON line:', trimmed.slice(0, 100));
+             } catch {}
+           }
+         }
+       }
+     } else if (onProgress) {
+       // Simple progress for non-streaming formats
+       onProgress({
+         progress: out.length,
+         message: `Received ${out.length} bytes of output...`
+       });
+     }
    });
 
    child.stderr.on('data', (d) => {
      err += d.toString();
+     // Don't send progress notifications for stderr - just collect it
+     // It will be included in the final result if there's an error
    });
 
    child.on('error', (e) => {
@@ -440,6 +585,15 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
      if (settled) return;
      settled = true;
      cleanup();
+
+     // Process any remaining partial line
+     if (useStreamJson && onProgress && partialLine.trim()) {
+       try {
+         const event = JSON.parse(partialLine.trim());
+         handleStreamEvent(event);
+       } catch {}
+     }
+
      const closeEnv = getValidatedEnv();
      if (closeEnv.DEBUG_CURSOR_MCP) {
        try { console.error('[cursor-mcp] exit:', code, 'stdout bytes=', out.length, 'stderr bytes=', err.length); } catch {}
@@ -458,7 +612,7 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
 
 // Back-compat: single-shot run by prompt as positional argument.
 // Accepts either a flat args object or an object with an "arguments" field (some hosts).
-async function runCursorAgent(input) {
+async function runCursorAgent(input, onProgress) {
   const source = (input && typeof input === 'object' && input.arguments && typeof input.prompt === 'undefined')
     ? input.arguments
     : input;
@@ -488,7 +642,7 @@ async function runCursorAgent(input) {
     } catch {}
   }
 
-  const result = await invokeCursorAgent({ argv, output_format, cwd, executable, model, force });
+  const result = await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, onProgress });
 
   // Echo prompt either when env is set or when caller provided echo_prompt: true (if host forwards unknown args it's fine)
   const echoEnv = getValidatedEnv();
@@ -500,6 +654,38 @@ async function runCursorAgent(input) {
   }
 
   return result;
+}
+
+// Helper to create progress callback from extra context
+function createProgressCallback(extra) {
+  const progressToken = extra?._meta?.progressToken;
+  const sendNotification = extra?.sendNotification;
+
+  if (!progressToken || !sendNotification) {
+    return undefined;
+  }
+
+  return async (progress) => {
+    try {
+      await sendNotification({
+        method: 'notifications/progress',
+        params: {
+          progressToken,
+          progress: progress.progress,
+          total: progress.total,
+          message: progress.message
+        }
+      });
+    } catch (e) {
+      // Silently ignore progress notification errors
+      const debugEnv = getValidatedEnv();
+      if (debugEnv.DEBUG_CURSOR_MCP) {
+        try {
+          console.error('[cursor-mcp] progress notification error:', e);
+        } catch {}
+      }
+    }
+  };
 }
 
 // Use validated EXECUTING_CLIENT environment variable
@@ -596,7 +782,7 @@ server.tool(
   'cursor_agent_chat',
   'Chat with cursor-agent using a prompt and optional model/force/output_format.',
   CHAT_SCHEMA.shape,
-  async (args) => {
+  async (args, extra) => {
     try {
       // Normalize prompt in case the host nests under "arguments"
       const prompt =
@@ -608,7 +794,8 @@ server.tool(
         prompt,
       };
 
-      return await runCursorAgent(flat);
+      const onProgress = createProgressCallback(extra);
+      return await runCursorAgent(flat, onProgress);
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -620,11 +807,12 @@ server.tool(
  'cursor_agent_raw',
  'Advanced: provide raw argv array to pass after common flags (e.g., ["search","--query","foo"]).',
  RAW_SCHEMA.shape,
- async (args) => {
+ async (args, extra) => {
    try {
      const { argv, output_format, cwd, executable, model, force } = args;
      // For raw calls we disable implicit --print to allow commands like "--help"
-     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false });
+     const onProgress = createProgressCallback(extra);
+     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false, onProgress });
    } catch (e) {
      return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
    }
@@ -637,7 +825,7 @@ if (executingClient !== 'cursor') {
     'cursor_agent_edit_file',
     'Edit a file with an instruction. Prompt-based wrapper; no CLI subcommand required.',
     EDIT_FILE_SCHEMA.shape,
-    async (args) => {
+    async (args, extra) => {
       try {
         const { file, instruction, apply, dry_run, prompt, output_format, cwd, executable, model, force, extra_args } = args;
         const validatedFile = validateFilePath(file);
@@ -648,7 +836,8 @@ if (executingClient !== 'cursor') {
           (apply ? `- Apply changes if safe.\n` : `- Propose a patch/diff without applying.\n`) +
           (dry_run ? `- Treat as dry-run; do not write to disk.\n` : ``) +
           (prompt ? `- Additional context: ${String(prompt)}\n` : ``);
-        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force });
+        const onProgress = createProgressCallback(extra);
+        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress);
       } catch (e) {
         return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
       }
@@ -659,7 +848,7 @@ if (executingClient !== 'cursor') {
     'cursor_agent_analyze_files',
     'Analyze one or more paths; optional prompt. Prompt-based wrapper.',
     ANALYZE_FILES_SCHEMA.shape,
-    async (args) => {
+    async (args, extra) => {
       try {
         const { paths, prompt, output_format, cwd, executable, model, force, extra_args } = args;
         const list = Array.isArray(paths) ? paths : [paths];
@@ -668,7 +857,8 @@ if (executingClient !== 'cursor') {
           `Analyze the following paths in the repository:\n` +
           validatedPaths.map((p) => `- ${String(p)}`).join('\n') + '\n' +
           (prompt ? `Additional prompt: ${String(prompt)}\n` : '');
-        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force });
+        const onProgress = createProgressCallback(extra);
+        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress);
       } catch (e) {
         return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
       }
@@ -679,7 +869,7 @@ if (executingClient !== 'cursor') {
     'cursor_agent_search_repo',
     'Search repository code with include/exclude patterns. Prompt-based wrapper.',
     SEARCH_REPO_SCHEMA.shape,
-    async (args) => {
+    async (args, extra) => {
       try {
         const { query, include, exclude, output_format, cwd, executable, model, force, extra_args } = args;
         const inc = include == null ? [] : (Array.isArray(include) ? include : [include]);
@@ -690,7 +880,8 @@ if (executingClient !== 'cursor') {
           (inc.length ? `- Include globs:\n${inc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
           (exc.length ? `- Exclude globs:\n${exc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
           `Return concise findings with file paths and line references.`;
-        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force });
+        const onProgress = createProgressCallback(extra);
+        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress);
       } catch (e) {
         return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
       }
@@ -701,7 +892,7 @@ if (executingClient !== 'cursor') {
     'cursor_agent_plan_task',
     'Generate a plan for a goal with optional constraints. Prompt-based wrapper.',
     PLAN_TASK_SCHEMA.shape,
-    async (args) => {
+    async (args, extra) => {
       try {
         const { goal, constraints, output_format, cwd, executable, model, force, extra_args } = args;
         const cons = constraints ?? [];
@@ -710,7 +901,8 @@ if (executingClient !== 'cursor') {
           `- Goal: ${String(goal)}\n` +
           (cons.length ? `- Constraints:\n${cons.map((c)=>`  - ${String(c)}`).join('\n')}\n` : '') +
           `Provide a numbered list of actions.`;
-        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force });
+        const onProgress = createProgressCallback(extra);
+        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress);
       } catch (e) {
         return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
       }
@@ -722,9 +914,10 @@ if (executingClient !== 'cursor') {
    'cursor_agent_run',
    'Run cursor-agent with a prompt and desired output format (legacy single-shot).',
    RUN_SCHEMA.shape,
-   async (args) => {
+   async (args, extra) => {
      try {
-       return await runCursorAgent(args);
+       const onProgress = createProgressCallback(extra);
+       return await runCursorAgent(args, onProgress);
      } catch (e) {
        return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
      }
