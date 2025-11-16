@@ -67,7 +67,7 @@ describe('invokeCursorAgent', () => {
 
     expect(spawn).toHaveBeenCalledWith(
       'cursor-agent',
-      expect.arrayContaining(['-m', 'gpt-4']),
+      expect.arrayContaining(['--model', 'gpt-4']),
       expect.any(Object),
     );
   });
@@ -94,7 +94,7 @@ describe('invokeCursorAgent', () => {
 
     expect(spawn).toHaveBeenCalledWith(
       'cursor-agent',
-      expect.arrayContaining(['-m', 'gpt-3.5-turbo']),
+      expect.arrayContaining(['--model', 'gpt-3.5-turbo']),
       expect.any(Object),
     );
   });
