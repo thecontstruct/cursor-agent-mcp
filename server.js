@@ -382,6 +382,7 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
   let accumulatedText = '';
   let toolCount = 0;
   let partialLine = ''; // Buffer for incomplete JSON lines
+  let pendingAssistantProgress = false; // Track if we have unsent assistant progress
 
   // Arrays to accumulate progress messages and events for logging
   const progressMessages = [];
@@ -556,6 +557,17 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
     }
   };
 
+  // Helper to flush pending assistant progress before sending other updates
+  const flushPendingAssistantProgress = () => {
+    if (pendingAssistantProgress && accumulatedText && onProgress) {
+      onProgress({
+        progress: accumulatedText.length,
+        message: `Response generated: (${accumulatedText.length} characters)`
+      });
+      pendingAssistantProgress = false;
+    }
+  };
+
   // Helper to handle stream-json events
   const handleStreamEvent = (event) => {
     if (!event || typeof event !== 'object') return;
@@ -590,17 +602,16 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
             progressMessages.push({ timestamp, type: 'PROGRESS', message: text });
             // Continue accumulating for onProgress callback
             accumulatedText += text;
-            if (onProgress) {
-              onProgress({
-                progress: accumulatedText.length,
-                message: `Generating response... (${accumulatedText.length} characters)`
-              });
-            }
+            // Mark that we have pending progress, but don't send it yet
+            pendingAssistantProgress = true;
           }
           break;
 
         case 'tool_call':
           if (subtype === 'started') {
+            // Flush any pending assistant progress before tool call update
+            flushPendingAssistantProgress();
+
             toolCount++;
             const toolCall = event.tool_call;
 
@@ -660,6 +671,9 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
           break;
 
         case 'result':
+          // Flush any pending assistant progress before result update
+          flushPendingAssistantProgress();
+
           const duration = event.duration_ms || 0;
           const resultProgressMsg = `Completed in ${duration}ms`;
           progressMessages.push({ timestamp, type: 'PROGRESS', message: resultProgressMsg });
@@ -789,6 +803,9 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
          handleStreamEvent(event);
        } catch {}
      }
+
+     // Flush any pending assistant progress before closing
+     flushPendingAssistantProgress();
 
     const closeEnv = getValidatedEnv();
     if (closeEnv.DEBUG_CURSOR_MCP) {
