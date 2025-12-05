@@ -396,6 +396,7 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
     try {
       const tempDir = os.tmpdir();
       streamLogFilePath = path.join(tempDir, streamLogFilename);
+      console.error(`[cursor-mcp] Stream log file: ${streamLogFilePath}`);
     } catch (e) {
       // If we can't create the path now, writeStreamLog will handle it later
     }
@@ -706,7 +707,13 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
            // Not valid JSON - might be partial or malformed, skip it
            if (debugEnv2.DEBUG_CURSOR_MCP) {
              try {
-               console.error('[cursor-mcp] failed to parse JSON line:', trimmed.slice(0, 100));
+               const preview = trimmed.length > 200 ? trimmed.slice(0, 200) + '...' : trimmed;
+               const errorMsg = e instanceof Error ? e.message : String(e);
+               const stack = e instanceof Error ? e.stack : undefined;
+               console.error(`[cursor-mcp] Failed to parse JSON line (${errorMsg}):`, preview);
+               if (stack) {
+                 console.error('[cursor-mcp] Stack trace:', stack);
+               }
              } catch {}
            }
          }
