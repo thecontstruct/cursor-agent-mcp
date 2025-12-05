@@ -397,7 +397,7 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
     try {
       const tempDir = os.tmpdir();
       streamLogFilePath = path.join(tempDir, streamLogFilename);
-      console.error(`[cursor-mcp] Stream log file: ${streamLogFilePath}`);
+      console.info(`[cursor-mcp] Stream log file: ${streamLogFilePath}`);
     } catch (e) {
       // If we can't create the path now, writeStreamLog will handle it later
     }
@@ -446,7 +446,7 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
    const debugEnv2 = getValidatedEnv();
    if (debugEnv2.DEBUG_CURSOR_MCP) {
      try {
-       console.error('[cursor-mcp] spawn:', cmd, ...finalArgv);
+       console.info('[cursor-mcp] spawn:', cmd, ...finalArgv);
      } catch {}
    }
 
@@ -864,10 +864,10 @@ async function runCursorAgent(input, onProgress, signal) {
   if (debugEnv.DEBUG_CURSOR_MCP) {
     try {
       const preview = usedPrompt.slice(0, 400).replace(/\n/g, '\\n');
-      console.error('[cursor-mcp] prompt:', preview);
-      if (extra_args?.length) console.error('[cursor-mcp] extra_args:', JSON.stringify(extra_args));
-      if (model) console.error('[cursor-mcp] model:', model);
-      if (typeof force === 'boolean') console.error('[cursor-mcp] force:', String(force));
+      console.debug('[cursor-mcp] prompt:', preview);
+      if (extra_args?.length) console.debug('[cursor-mcp] extra_args:', JSON.stringify(extra_args));
+      if (model) console.debug('[cursor-mcp] model:', model);
+      if (typeof force === 'boolean') console.debug('[cursor-mcp] force:', String(force));
     } catch {}
   }
 
