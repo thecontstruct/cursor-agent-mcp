@@ -154,13 +154,8 @@ describe('invokeCursorAgent', () => {
 
     expect(result.content[0].type).toBe('text');
     expect(result.content[0].text).toContain('successful output');
-    expect(result.content[0].text).toContain('Sub agent activity log:');
     expect(result.isError).toBeUndefined();
-
-    // Clean up
-    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
-    }
+    // No stream log for non-streaming output format
   });
 
   it('should return error when process exits with non-zero code', async () => {
@@ -437,7 +432,7 @@ describe('Tool handler composition logic', () => {
   });
 });
 
-describe('Progress log accumulation', () => {
+describe('Stream log and accumulated text', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     delete process.env.CURSOR_AGENT_ECHO_PROMPT;
@@ -448,7 +443,7 @@ describe('Progress log accumulation', () => {
     vi.useRealTimers();
   });
 
-  it('should accumulate progress messages across multiple events', async () => {
+  it('should return accumulated text from stream-json events', async () => {
     const streamJsonEvents = [
       JSON.stringify({ type: 'system', subtype: 'init', model: 'gpt-4' }) + '\n',
       JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Hello' }] } }) + '\n',
@@ -466,28 +461,26 @@ describe('Progress log accumulation', () => {
       onProgress
     });
 
-    expect(result.progressLogFile).toBeDefined();
-    expect(fs.existsSync(result.progressLogFile)).toBe(true);
+    // Should return accumulated text, not raw JSON
+    expect(result.content[0].text).toContain('Hello world');
+    expect(result.content[0].text).toContain('Full stream log:');
+    expect(result.streamLogFile).toBeDefined();
+    expect(fs.existsSync(result.streamLogFile)).toBe(true);
 
-    const logContent = fs.readFileSync(result.progressLogFile, 'utf8');
+    // Stream log should contain raw JSON events
+    const logContent = fs.readFileSync(result.streamLogFile, 'utf8');
     const lines = logContent.trim().split('\n');
-
-    // Should have multiple progress messages (no EVENT messages)
-    // 4 progress messages: init, Hello, world, Completed
-    expect(lines.length).toBeGreaterThanOrEqual(4);
-    expect(logContent).toContain('Initializing cursor-agent');
-    expect(logContent).toContain('Hello');
-    expect(logContent).toContain(' world');
-    expect(logContent).toContain('Completed in 100ms');
-    expect(logContent).not.toContain('EVENT:');
+    expect(lines.length).toBe(4);
+    expect(JSON.parse(lines[0]).type).toBe('system');
+    expect(JSON.parse(lines[1]).type).toBe('assistant');
 
     // Clean up
-    if (fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
+    if (fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
     }
   });
 
-  it('should extract text correctly for each event type', async () => {
+  it('should save all event types to stream log', async () => {
     const streamJsonEvents = [
       JSON.stringify({ type: 'system', subtype: 'init', model: 'gpt-4' }) + '\n',
       JSON.stringify({
@@ -517,73 +510,29 @@ describe('Progress log accumulation', () => {
       onProgress
     });
 
-    expect(result.progressLogFile).toBeDefined();
-    const logContent = fs.readFileSync(result.progressLogFile, 'utf8');
-
-    // Check for progress messages (not event messages)
-    expect(logContent).toContain('Initializing cursor-agent (model: gpt-4)');
-
-    // Check for tool call progress messages
-    expect(logContent).toContain('Writing file: /test/file.js');
-    expect(logContent).toContain('✅ Created 10 lines (200 bytes)');
-
-    // Check for result progress message
-    expect(logContent).toContain('Completed in 150ms');
-
-    // Verify no EVENT messages are in the log
-    expect(logContent).not.toContain('EVENT:');
-    expect(logContent).not.toContain('Tool call started:');
-    expect(logContent).not.toContain('Tool call completed:');
-    expect(logContent).not.toContain('System initialized with model:');
-
-    // Clean up
-    if (fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
-    }
-  });
-
-  it('should verify newlines separate events correctly', async () => {
-    const streamJsonEvents = [
-      JSON.stringify({ type: 'system', subtype: 'init', model: 'gpt-4' }) + '\n',
-      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'First' }] } }) + '\n',
-      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Second' }] } }) + '\n',
-      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Third' }] } }) + '\n',
-    ];
-
-    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
-    vi.mocked(spawn).mockReturnValue(mockProcess);
-
-    const onProgress = vi.fn();
-    const result = await invokeCursorAgent({
-      argv: ['test'],
-      output_format: 'text',
-      onProgress
-    });
-
-    expect(result.progressLogFile).toBeDefined();
-    const logContent = fs.readFileSync(result.progressLogFile, 'utf8');
+    expect(result.streamLogFile).toBeDefined();
+    const logContent = fs.readFileSync(result.streamLogFile, 'utf8');
     const lines = logContent.trim().split('\n');
 
-    // Each line should be a separate event/message
-    expect(lines.length).toBeGreaterThan(3);
-
-    // Each line should start with a timestamp
-    lines.forEach(line => {
-      if (line.trim()) {
-        expect(line).toMatch(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\]/);
-      }
-    });
+    // All events should be in the log as JSON
+    expect(lines.length).toBe(4);
+    const events = lines.map(line => JSON.parse(line));
+    expect(events[0].type).toBe('system');
+    expect(events[1].type).toBe('tool_call');
+    expect(events[1].subtype).toBe('started');
+    expect(events[2].type).toBe('tool_call');
+    expect(events[2].subtype).toBe('completed');
+    expect(events[3].type).toBe('result');
 
     // Clean up
-    if (fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
+    if (fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
     }
   });
 
-  it('should handle partial JSON line handling (dropping incomplete lines)', async () => {
-    // Send a complete event, then a partial event that will be completed later
+  it('should handle partial JSON lines gracefully', async () => {
     const completeEvent = JSON.stringify({ type: 'system', subtype: 'init', model: 'gpt-4' }) + '\n';
-    const partialEvent = JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Hello' }] } }).slice(0, 20); // Incomplete
+    const partialEvent = JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Hello' }] } }).slice(0, 20);
 
     const mockProcess = createMockChildProcess({
       stdout: completeEvent + partialEvent,
@@ -598,57 +547,67 @@ describe('Progress log accumulation', () => {
       onProgress
     });
 
-    expect(result.progressLogFile).toBeDefined();
-    const logContent = fs.readFileSync(result.progressLogFile, 'utf8');
-
-    // Should have processed the complete event (progress message format)
-    expect(logContent).toContain('Initializing cursor-agent');
-
-    // Partial event should not cause errors (it's buffered and processed on close if complete)
-    // The partial line should be handled gracefully
+    // Should have stream log with at least the complete event
+    expect(result.streamLogFile).toBeDefined();
+    const logContent = fs.readFileSync(result.streamLogFile, 'utf8');
+    expect(logContent).toContain('"type":"system"');
 
     // Clean up
-    if (fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
+    if (fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
     }
   });
 
-  it('should include progressLogFile in error results', async () => {
-    const mockProcess = createMockChildProcess({ stdout: 'output', stderr: 'error', exitCode: 1 });
+  it('should not create stream log for non-streaming output', async () => {
+    const mockProcess = createMockChildProcess({ stdout: 'plain output', exitCode: 0 });
     vi.mocked(spawn).mockReturnValue(mockProcess);
 
-    const result = await invokeCursorAgent({ argv: ['test'] });
+    const result = await invokeCursorAgent({ argv: ['test'], output_format: 'text' });
+
+    // No onProgress = no streaming = no stream log
+    expect(result.streamLogFile).toBeUndefined();
+    expect(result.content[0].text).toBe('plain output');
+  });
+
+  it('should include streamLogFile in error results when streaming', async () => {
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'system', subtype: 'init', model: 'gpt-4' }) + '\n',
+    ];
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), stderr: 'error', exitCode: 1 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({ argv: ['test'], onProgress });
 
     expect(result.isError).toBe(true);
-    expect(result.progressLogFile).toBeDefined();
+    expect(result.streamLogFile).toBeDefined();
+    expect(result.content[0].text).toContain('Full stream log:');
 
     // Clean up
-    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
+    if (result.streamLogFile && fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
     }
   });
 
-  it('should include progressLogFile in timeout results', async () => {
+  it('should handle timeout gracefully with no events processed', async () => {
     vi.useFakeTimers();
     process.env.CURSOR_AGENT_TIMEOUT_MS = '100';
     const mockProcess = createMockChildProcess({ stdout: '', exitCode: 0, delay: 200 });
     vi.mocked(spawn).mockReturnValue(mockProcess);
 
-    const resultPromise = invokeCursorAgent({ argv: ['test'] });
+    const onProgress = vi.fn();
+    const resultPromise = invokeCursorAgent({ argv: ['test'], onProgress });
     vi.advanceTimersByTime(150);
 
     const result = await resultPromise;
 
     expect(result.isError).toBe(true);
-    expect(result.progressLogFile).toBeDefined();
-
-    // Clean up
-    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
-    }
+    expect(result.content[0].text).toContain('timed out');
+    // No stream log when no events were processed before timeout
+    expect(result.streamLogFile).toBeUndefined();
   });
 
-  it('should log assistant message deltas without accumulation', async () => {
+  it('should accumulate text deltas correctly', async () => {
     const streamJsonEvents = [
       JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Hello' }] } }) + '\n',
       JSON.stringify({ type: 'assistant', message: { content: [{ text: ' world' }] } }) + '\n',
@@ -665,27 +624,17 @@ describe('Progress log accumulation', () => {
       onProgress
     });
 
-    expect(result.progressLogFile).toBeDefined();
-    const logContent = fs.readFileSync(result.progressLogFile, 'utf8');
-
-    // Each delta should be logged separately, not accumulated (format: [timestamp] message)
-    expect(logContent).toContain('Hello');
-    expect(logContent).toContain(' world');
-    expect(logContent).toContain('!');
-
-    // Should not see "Hello world!" as a single message (that would indicate accumulation)
-    const progressLines = logContent.split('\n').filter(line => line.includes('Hello') || line.includes(' world') || line.includes('!'));
-    const helloWorldLine = progressLines.find(line => line.includes('Hello') && line.includes('world') && line.includes('!'));
-    expect(helloWorldLine).toBeUndefined();
+    // Response should contain accumulated text
+    expect(result.content[0].text).toContain('Hello world!');
 
     // Clean up
-    if (fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
+    if (result.streamLogFile && fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
     }
   });
 });
 
-describe('Activity log path appending', () => {
+describe('Stream log path appending', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     delete process.env.CURSOR_AGENT_ECHO_PROMPT;
@@ -696,151 +645,184 @@ describe('Activity log path appending', () => {
     vi.useRealTimers();
   });
 
-  it('should append activity log path to success result content text', async () => {
-    const mockProcess = createMockChildProcess({ stdout: 'test output', exitCode: 0 });
+  it('should append stream log path to success result when streaming', async () => {
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'test output' }] } }) + '\n',
+    ];
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
     vi.mocked(spawn).mockReturnValue(mockProcess);
 
-    const result = await invokeCursorAgent({ argv: ['test'], output_format: 'text' });
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({ argv: ['test'], output_format: 'text', onProgress });
 
-    expect(result.progressLogFile).toBeDefined();
+    expect(result.streamLogFile).toBeDefined();
     expect(result.content).toBeDefined();
     expect(result.content[0].type).toBe('text');
     expect(result.content[0].text).toContain('test output');
-    expect(result.content[0].text).toContain('Sub agent activity log:');
-    expect(result.content[0].text).toContain(result.progressLogFile);
+    expect(result.content[0].text).toContain('Full stream log:');
+    expect(result.content[0].text).toContain(result.streamLogFile);
 
     // Clean up
-    if (fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
+    if (fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
     }
   });
 
-  it('should append activity log path to error result content text', async () => {
-    const mockProcess = createMockChildProcess({ stdout: 'output', stderr: 'error', exitCode: 1 });
+  it('should not append stream log path for non-streaming calls', async () => {
+    const mockProcess = createMockChildProcess({ stdout: 'test output', exitCode: 0 });
     vi.mocked(spawn).mockReturnValue(mockProcess);
 
     const result = await invokeCursorAgent({ argv: ['test'] });
 
+    expect(result.streamLogFile).toBeUndefined();
+    expect(result.content[0].text).toBe('test output');
+    expect(result.content[0].text).not.toContain('Full stream log:');
+  });
+
+  it('should append stream log path to error result when streaming', async () => {
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'output' }] } }) + '\n',
+    ];
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), stderr: 'error', exitCode: 1 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({ argv: ['test'], onProgress });
+
     expect(result.isError).toBe(true);
-    expect(result.progressLogFile).toBeDefined();
-    expect(result.content).toBeDefined();
-    expect(result.content[0].type).toBe('text');
+    expect(result.streamLogFile).toBeDefined();
     expect(result.content[0].text).toContain('cursor-agent exited with code 1');
-    expect(result.content[0].text).toContain('Sub agent activity log:');
-    expect(result.content[0].text).toContain(result.progressLogFile);
+    expect(result.content[0].text).toContain('Full stream log:');
 
     // Clean up
-    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
+    if (result.streamLogFile && fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
     }
   });
 
-  it('should append activity log path to timeout result content text', async () => {
+  it('should handle timeout without stream log when no events processed', async () => {
     vi.useFakeTimers();
     process.env.CURSOR_AGENT_TIMEOUT_MS = '100';
     const mockProcess = createMockChildProcess({ stdout: '', exitCode: 0, delay: 200 });
     vi.mocked(spawn).mockReturnValue(mockProcess);
 
-    const resultPromise = invokeCursorAgent({ argv: ['test'] });
+    const onProgress = vi.fn();
+    const resultPromise = invokeCursorAgent({ argv: ['test'], onProgress });
     vi.advanceTimersByTime(150);
 
     const result = await resultPromise;
 
     expect(result.isError).toBe(true);
-    expect(result.progressLogFile).toBeDefined();
-    expect(result.content).toBeDefined();
-    expect(result.content[0].type).toBe('text');
     expect(result.content[0].text).toContain('cursor-agent timed out after 100ms');
-    expect(result.content[0].text).toContain('Sub agent activity log:');
-    expect(result.content[0].text).toContain(result.progressLogFile);
-
-    // Clean up
-    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
-    }
+    // No stream log or partial response when timeout occurs before any events
+    expect(result.streamLogFile).toBeUndefined();
+    expect(result.content[0].text).not.toContain('Full stream log:');
   });
 
-  it('should append activity log path to process error result content text', async () => {
-    const mockProcess = createMockChildProcess({
-      stdout: '',
-      exitCode: 0,
-      shouldError: true,
-      errorMessage: 'Failed to spawn',
-      delay: 10
-    });
-    vi.mocked(spawn).mockReturnValue(mockProcess);
-
-    const result = await invokeCursorAgent({ argv: ['test'] });
-
-    expect(result.isError).toBe(true);
-    expect(result.progressLogFile).toBeDefined();
-    expect(result.content).toBeDefined();
-    expect(result.content[0].type).toBe('text');
-    expect(result.content[0].text).toContain('Failed to start');
-    expect(result.content[0].text).toContain('Sub agent activity log:');
-    expect(result.content[0].text).toContain(result.progressLogFile);
-
-    // Clean up
-    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
-    }
-  });
-
-  it('should not append activity log path when writeProgressLog fails', async () => {
-    // Mock fs.writeFileSync to throw an error to simulate writeProgressLog failure
+  it('should not append stream log path when writeStreamLog fails', async () => {
     const originalWriteFileSync = fs.writeFileSync;
     vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {
       throw new Error('Cannot write to file');
     });
 
-    const mockProcess = createMockChildProcess({ stdout: 'test output', exitCode: 0 });
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'test output' }] } }) + '\n',
+    ];
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
     vi.mocked(spawn).mockReturnValue(mockProcess);
 
-    const result = await invokeCursorAgent({ argv: ['test'] });
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({ argv: ['test'], onProgress });
 
-    expect(result.progressLogFile).toBeUndefined();
-    expect(result.content).toBeDefined();
-    expect(result.content[0].type).toBe('text');
+    expect(result.streamLogFile).toBeUndefined();
     expect(result.content[0].text).toBe('test output');
-    expect(result.content[0].text).not.toContain('Sub agent activity log:');
+    expect(result.content[0].text).not.toContain('Full stream log:');
 
-    // Restore original writeFileSync
     fs.writeFileSync = originalWriteFileSync;
   });
 
-  it('should use system temp directory for activity log path', async () => {
-    const mockProcess = createMockChildProcess({ stdout: 'test output', exitCode: 0 });
+  it('should use system temp directory for stream log path', async () => {
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'test' }] } }) + '\n',
+    ];
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
     vi.mocked(spawn).mockReturnValue(mockProcess);
 
-    const result = await invokeCursorAgent({ argv: ['test'] });
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({ argv: ['test'], onProgress });
 
-    expect(result.progressLogFile).toBeDefined();
+    expect(result.streamLogFile).toBeDefined();
     const os = require('node:os');
     const tempDir = os.tmpdir();
-    expect(result.progressLogFile).toMatch(new RegExp(`^${tempDir.replace(/\\/g, '\\\\')}`));
-    expect(result.progressLogFile).toMatch(/cursor-agent-progress-/);
+    expect(result.streamLogFile).toMatch(new RegExp(`^${tempDir.replace(/\\/g, '\\\\')}`));
+    expect(result.streamLogFile).toMatch(/cursor-agent-stream-/);
 
     // Clean up
-    if (fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
+    if (fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
     }
   });
 
-  it('should format activity log path correctly with newlines', async () => {
-    const mockProcess = createMockChildProcess({ stdout: 'test output', exitCode: 0 });
+  it('should format stream log path correctly with separator', async () => {
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'test output' }] } }) + '\n',
+    ];
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
     vi.mocked(spawn).mockReturnValue(mockProcess);
 
-    const result = await invokeCursorAgent({ argv: ['test'] });
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({ argv: ['test'], onProgress });
 
-    expect(result.content[0].text).toMatch(/test output\n\nSub agent activity log: /);
-    const parts = result.content[0].text.split('\n\nSub agent activity log: ');
-    expect(parts.length).toBe(2);
-    expect(parts[0]).toBe('test output');
-    expect(parts[1]).toBe(result.progressLogFile);
+    expect(result.content[0].text).toMatch(/test output\n\n---\nFull stream log: /);
+    // Format is now: path (N events, X.XKB)
+    expect(result.content[0].text).toContain(result.streamLogFile);
+    expect(result.content[0].text).toMatch(/\(1 events?, \d+\.\d+KB\)/);
 
     // Clean up
-    if (fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
+    if (fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
+    }
+  });
+
+  it('should show warning for large stream logs', async () => {
+    // Create enough events to trigger the "large" threshold (>50 events)
+    const streamJsonEvents = [];
+    for (let i = 0; i < 55; i++) {
+      streamJsonEvents.push(JSON.stringify({ type: 'assistant', message: { content: [{ text: `chunk ${i}` }] } }) + '\n');
+    }
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({ argv: ['test'], onProgress });
+
+    expect(result.content[0].text).toContain('Full stream log:');
+    expect(result.content[0].text).toMatch(/\(55 events, \d+\.\d+KB\)/);
+    expect(result.content[0].text).toContain('⚠️ Large log - use semantic search or grep instead of reading entire file if more details are needed');
+
+    // Clean up
+    if (fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
+    }
+  });
+
+  it('should not show warning for small stream logs', async () => {
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'small output' }] } }) + '\n',
+    ];
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({ argv: ['test'], onProgress });
+
+    expect(result.content[0].text).toContain('Full stream log:');
+    expect(result.content[0].text).toMatch(/\(1 events?, \d+\.\d+KB\)/);
+    expect(result.content[0].text).not.toContain('⚠️');
+
+    // Clean up
+    if (fs.existsSync(result.streamLogFile)) {
+      fs.unlinkSync(result.streamLogFile);
     }
   });
 });
@@ -865,12 +847,35 @@ describe('Cancellation support', () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('cancelled');
-    expect(result.content[0].text).toContain('Sub agent activity log:');
+    // No stream log for non-streaming cancellation
+  });
 
-    // Clean up
-    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
-    }
+  it('should handle cancellation with streaming when no events processed yet', async () => {
+    const abortController = new AbortController();
+    const mockProcess = createMockChildProcess({
+      stdout: '',
+      exitCode: 0,
+      delay: 100,
+    });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const onProgress = vi.fn();
+    const promise = invokeCursorAgent({
+      argv: ['test'],
+      signal: abortController.signal,
+      onProgress,
+    });
+
+    await Promise.resolve();
+    abortController.abort('User cancelled');
+
+    const result = await promise;
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('cancelled');
+    expect(result.content[0].text).toContain('User cancelled');
+    // No stream log or partial response when cancelled before any events
+    expect(result.streamLogFile).toBeUndefined();
   });
 
   it('should kill child process when signal is aborted', async () => {
@@ -888,8 +893,6 @@ describe('Cancellation support', () => {
       signal: abortController.signal,
     });
 
-    // Abort immediately after process starts (before it completes)
-    // Use a microtask to ensure the process is spawned first
     await Promise.resolve();
     abortController.abort('User cancelled');
 
@@ -912,8 +915,6 @@ describe('Cancellation support', () => {
       signal: abortController.signal,
     });
 
-    // Verify listener was removed (cleanup was called)
-    // The cleanup function removes the listener, so we check it was called
     expect(removeEventListenerSpy).toHaveBeenCalled();
   });
 
@@ -928,12 +929,8 @@ describe('Cancellation support', () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain('output');
-    expect(result.content[0].text).toContain('Sub agent activity log:');
-
-    // Clean up
-    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
-      fs.unlinkSync(result.progressLogFile);
-    }
+    // No stream log for non-streaming calls
+    expect(result.streamLogFile).toBeUndefined();
   });
 
   it('should include cancellation reason in error message', async () => {

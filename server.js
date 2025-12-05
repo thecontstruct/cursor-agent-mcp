@@ -387,30 +387,58 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
   const progressMessages = [];
   const events = [];
 
-  // Helper to write progress log to temp file
-  const writeProgressLog = () => {
+  // Pre-compute log file path if we'll be using stream-json
+  let streamLogFilePath = null;
+  let streamLogFilename = null;
+  if (useStreamJson) {
+    // Generate filename once to ensure consistency
+    streamLogFilename = `cursor-agent-stream-${Date.now()}-${Math.random().toString(36).slice(2)}.json`;
     try {
       const tempDir = os.tmpdir();
-      const filename = `cursor-agent-progress-${Date.now()}-${Math.random().toString(36).slice(2)}.log`;
-      const filePath = path.join(tempDir, filename);
-
-      // Filter to only include PROGRESS messages (exclude EVENT messages)
-      const progressOnly = progressMessages.filter(({ type }) => type === 'PROGRESS');
-      const lines = progressOnly.map(({ timestamp, message }) => {
-        return `[${timestamp}] ${message}`;
-      });
-
-      fs.writeFileSync(filePath, lines.join('\n') + '\n', 'utf8');
-      return filePath;
+      streamLogFilePath = path.join(tempDir, streamLogFilename);
     } catch (e) {
-      // Silently ignore file write errors to avoid breaking the main flow
+      // If we can't create the path now, writeStreamLog will handle it later
+    }
+  }
+
+  // Helper to write stream log to temp file (full JSON events for optional inspection)
+  const writeStreamLog = () => {
+    if (!useStreamJson || events.length === 0) return null;
+    try {
+      const filePath = streamLogFilePath || (() => {
+        const tempDir = os.tmpdir();
+        const filename = streamLogFilename || `cursor-agent-stream-${Date.now()}-${Math.random().toString(36).slice(2)}.json`;
+        return path.join(tempDir, filename);
+      })();
+
+      const lines = events.map(e => JSON.stringify(e));
+      const content = lines.join('\n') + '\n';
+      fs.writeFileSync(filePath, content, 'utf8');
+      return {
+        path: filePath,
+        eventCount: events.length,
+        sizeBytes: Buffer.byteLength(content, 'utf8')
+      };
+    } catch (e) {
       if (debugEnv2.DEBUG_CURSOR_MCP) {
         try {
-          console.error('[cursor-mcp] failed to write progress log:', e);
+          console.error('[cursor-mcp] failed to write stream log:', e);
         } catch {}
       }
       return null;
     }
+  };
+
+  // Format stream log reference with size info and optional warning
+  const formatStreamLogRef = (streamLog) => {
+    if (!streamLog) return '';
+    const sizeKB = (streamLog.sizeBytes / 1024).toFixed(1);
+    const isLarge = streamLog.eventCount > 50 || streamLog.sizeBytes > 50000;
+    let ref = `\n\n---\nFull stream log: ${streamLog.path} (${streamLog.eventCount} events, ${sizeKB}KB)`;
+    if (isLarge) {
+      ref += `\n⚠️ Large log - use semantic search or grep instead of reading entire file if more details are needed`;
+    }
+    return ref;
   };
 
    const debugEnv2 = getValidatedEnv();
@@ -433,14 +461,16 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
     settled = true;
     cleanup();
     try { child.kill('SIGKILL'); } catch {}
-    const progressLogFile = writeProgressLog();
+    const streamLog = writeStreamLog();
     const reason = signal?.reason || 'Request cancelled';
-    const baseText = `cursor-agent cancelled: ${reason}`;
-    const finalText = progressLogFile ? `${baseText}\n\nSub agent activity log: ${progressLogFile}` : baseText;
+    // Include any partial response accumulated before cancellation
+    const partialResponse = (useStreamJson && accumulatedText) ? `\nPartial response:\n${accumulatedText}` : '';
+    const baseText = `cursor-agent cancelled: ${reason}${partialResponse}`;
+    const finalText = baseText + formatStreamLogRef(streamLog);
     resolve({
       content: [{ type: 'text', text: finalText }],
       isError: true,
-      ...(progressLogFile && { progressLogFile })
+      ...(streamLog && { streamLogFile: streamLog.path })
     });
   };
 
@@ -573,6 +603,19 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
             toolCount++;
             const toolCall = event.tool_call;
 
+            // Log the stream log file location when the first tool call starts
+            if (toolCount === 1 && streamLogFilename) {
+              const logPath = streamLogFilePath || (() => {
+                try {
+                  const tempDir = os.tmpdir();
+                  return path.join(tempDir, streamLogFilename);
+                } catch (e) {
+                  return streamLogFilename;
+                }
+              })();
+              console.log(`[cursor-mcp] Stream log file: ${logPath}`);
+            }
+
             let progressMsg = '';
             if (toolCall?.writeToolCall) {
               const path = toolCall.writeToolCall?.args?.path || 'unknown';
@@ -698,12 +741,12 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
       `Failed to start "${cmd}": ${e?.message || e}\n` +
       `Args: ${JSON.stringify(finalArgv)}\n` +
       (safeEnv.CURSOR_AGENT_PATH ? `CURSOR_AGENT_PATH=${safeEnv.CURSOR_AGENT_PATH}\n` : '');
-    const progressLogFile = writeProgressLog();
-    const finalText = progressLogFile ? `${msg}\n\nSub agent activity log: ${progressLogFile}` : msg;
+    const streamLog = writeStreamLog();
+    const finalText = msg + formatStreamLogRef(streamLog);
     resolve({
       content: [{ type: 'text', text: finalText }],
       isError: true,
-      ...(progressLogFile && { progressLogFile })
+      ...(streamLog && { streamLogFile: streamLog.path })
     });
   });
 
@@ -715,13 +758,15 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
     if (settled) return;
     settled = true;
     cleanup();
-    const progressLogFile = writeProgressLog();
-    const baseText = `cursor-agent timed out after ${timeoutMs}ms`;
-    const finalText = progressLogFile ? `${baseText}\n\nSub agent activity log: ${progressLogFile}` : baseText;
+    const streamLog = writeStreamLog();
+    // Include any partial response accumulated before timeout
+    const partialResponse = (useStreamJson && accumulatedText) ? `\nPartial response:\n${accumulatedText}` : '';
+    const baseText = `cursor-agent timed out after ${timeoutMs}ms${partialResponse}`;
+    const finalText = baseText + formatStreamLogRef(streamLog);
     resolve({
       content: [{ type: 'text', text: finalText }],
       isError: true,
-      ...(progressLogFile && { progressLogFile })
+      ...(streamLog && { streamLogFile: streamLog.path })
     });
   }, timeoutMs);
 
@@ -742,21 +787,28 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
     if (closeEnv.DEBUG_CURSOR_MCP) {
       try { console.error('[cursor-mcp] exit:', code, 'stdout bytes=', out.length, 'stderr bytes=', err.length); } catch {}
     }
-    const progressLogFile = writeProgressLog();
+    const streamLog = writeStreamLog();
     if (code === 0 || (killedByIdle && out)) {
-      const baseText = out || '(no output)';
-      const finalText = progressLogFile ? `${baseText}\n\nSub agent activity log: ${progressLogFile}` : baseText;
+      // When using stream-json parsing, return only the accumulated final text
+      // The full stream is saved to a file for optional inspection
+      const baseText = (useStreamJson && accumulatedText)
+        ? accumulatedText
+        : (out || '(no output)');
+      const finalText = baseText + formatStreamLogRef(streamLog);
       resolve({
         content: [{ type: 'text', text: finalText }],
-        ...(progressLogFile && { progressLogFile })
+        ...(streamLog && { streamLogFile: streamLog.path })
       });
     } else {
-      const baseText = `cursor-agent exited with code ${code}\n${err || out || '(no output)'}`;
-      const finalText = progressLogFile ? `${baseText}\n\nSub agent activity log: ${progressLogFile}` : baseText;
+      // On error, prefer accumulated text if available, otherwise raw output
+      const baseText = (useStreamJson && accumulatedText)
+        ? `cursor-agent exited with code ${code}\n${accumulatedText}`
+        : `cursor-agent exited with code ${code}\n${err || out || '(no output)'}`;
+      const finalText = baseText + formatStreamLogRef(streamLog);
       resolve({
         content: [{ type: 'text', text: finalText }],
         isError: true,
-        ...(progressLogFile && { progressLogFile })
+        ...(streamLog && { streamLogFile: streamLog.path })
       });
     }
    });
