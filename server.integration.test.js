@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import fs from 'node:fs';
 import { invokeCursorAgent, runCursorAgent } from './server.js';
 import { createMockChildProcess } from './test/utils.js';
 
@@ -151,8 +152,15 @@ describe('invokeCursorAgent', () => {
 
     const result = await invokeCursorAgent({ argv: ['test'] });
 
-    expect(result.content).toEqual([{ type: 'text', text: 'successful output' }]);
+    expect(result.content[0].type).toBe('text');
+    expect(result.content[0].text).toContain('successful output');
+    expect(result.content[0].text).toContain('Sub agent activity log:');
     expect(result.isError).toBeUndefined();
+
+    // Clean up
+    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
   });
 
   it('should return error when process exits with non-zero code', async () => {
@@ -426,6 +434,519 @@ describe('Tool handler composition logic', () => {
     const callArgs = vi.mocked(spawn).mock.calls[0][1];
     expect(callArgs).not.toContain('--print');
     expect(callArgs).toContain('--help');
+  });
+});
+
+describe('Progress log accumulation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete process.env.CURSOR_AGENT_ECHO_PROMPT;
+    delete process.env.DEBUG_CURSOR_MCP;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('should accumulate progress messages across multiple events', async () => {
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'system', subtype: 'init', model: 'gpt-4' }) + '\n',
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Hello' }] } }) + '\n',
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: ' world' }] } }) + '\n',
+      JSON.stringify({ type: 'result', duration_ms: 100 }) + '\n',
+    ];
+
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({
+      argv: ['test'],
+      output_format: 'text',
+      onProgress
+    });
+
+    expect(result.progressLogFile).toBeDefined();
+    expect(fs.existsSync(result.progressLogFile)).toBe(true);
+
+    const logContent = fs.readFileSync(result.progressLogFile, 'utf8');
+    const lines = logContent.trim().split('\n');
+
+    // Should have multiple progress messages (no EVENT messages)
+    // 4 progress messages: init, Hello, world, Completed
+    expect(lines.length).toBeGreaterThanOrEqual(4);
+    expect(logContent).toContain('Initializing cursor-agent');
+    expect(logContent).toContain('Hello');
+    expect(logContent).toContain(' world');
+    expect(logContent).toContain('Completed in 100ms');
+    expect(logContent).not.toContain('EVENT:');
+
+    // Clean up
+    if (fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should extract text correctly for each event type', async () => {
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'system', subtype: 'init', model: 'gpt-4' }) + '\n',
+      JSON.stringify({
+        type: 'tool_call',
+        subtype: 'started',
+        tool_call: { writeToolCall: { args: { path: '/test/file.js' } } }
+      }) + '\n',
+      JSON.stringify({
+        type: 'tool_call',
+        subtype: 'completed',
+        tool_call: {
+          writeToolCall: {
+            result: { success: { linesCreated: 10, fileSize: 200 } }
+          }
+        }
+      }) + '\n',
+      JSON.stringify({ type: 'result', duration_ms: 150 }) + '\n',
+    ];
+
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({
+      argv: ['test'],
+      output_format: 'text',
+      onProgress
+    });
+
+    expect(result.progressLogFile).toBeDefined();
+    const logContent = fs.readFileSync(result.progressLogFile, 'utf8');
+
+    // Check for progress messages (not event messages)
+    expect(logContent).toContain('Initializing cursor-agent (model: gpt-4)');
+
+    // Check for tool call progress messages
+    expect(logContent).toContain('Writing file: /test/file.js');
+    expect(logContent).toContain('✅ Created 10 lines (200 bytes)');
+
+    // Check for result progress message
+    expect(logContent).toContain('Completed in 150ms');
+
+    // Verify no EVENT messages are in the log
+    expect(logContent).not.toContain('EVENT:');
+    expect(logContent).not.toContain('Tool call started:');
+    expect(logContent).not.toContain('Tool call completed:');
+    expect(logContent).not.toContain('System initialized with model:');
+
+    // Clean up
+    if (fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should verify newlines separate events correctly', async () => {
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'system', subtype: 'init', model: 'gpt-4' }) + '\n',
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'First' }] } }) + '\n',
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Second' }] } }) + '\n',
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Third' }] } }) + '\n',
+    ];
+
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({
+      argv: ['test'],
+      output_format: 'text',
+      onProgress
+    });
+
+    expect(result.progressLogFile).toBeDefined();
+    const logContent = fs.readFileSync(result.progressLogFile, 'utf8');
+    const lines = logContent.trim().split('\n');
+
+    // Each line should be a separate event/message
+    expect(lines.length).toBeGreaterThan(3);
+
+    // Each line should start with a timestamp
+    lines.forEach(line => {
+      if (line.trim()) {
+        expect(line).toMatch(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\]/);
+      }
+    });
+
+    // Clean up
+    if (fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should handle partial JSON line handling (dropping incomplete lines)', async () => {
+    // Send a complete event, then a partial event that will be completed later
+    const completeEvent = JSON.stringify({ type: 'system', subtype: 'init', model: 'gpt-4' }) + '\n';
+    const partialEvent = JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Hello' }] } }).slice(0, 20); // Incomplete
+
+    const mockProcess = createMockChildProcess({
+      stdout: completeEvent + partialEvent,
+      exitCode: 0
+    });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({
+      argv: ['test'],
+      output_format: 'text',
+      onProgress
+    });
+
+    expect(result.progressLogFile).toBeDefined();
+    const logContent = fs.readFileSync(result.progressLogFile, 'utf8');
+
+    // Should have processed the complete event (progress message format)
+    expect(logContent).toContain('Initializing cursor-agent');
+
+    // Partial event should not cause errors (it's buffered and processed on close if complete)
+    // The partial line should be handled gracefully
+
+    // Clean up
+    if (fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should include progressLogFile in error results', async () => {
+    const mockProcess = createMockChildProcess({ stdout: 'output', stderr: 'error', exitCode: 1 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const result = await invokeCursorAgent({ argv: ['test'] });
+
+    expect(result.isError).toBe(true);
+    expect(result.progressLogFile).toBeDefined();
+
+    // Clean up
+    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should include progressLogFile in timeout results', async () => {
+    vi.useFakeTimers();
+    process.env.CURSOR_AGENT_TIMEOUT_MS = '100';
+    const mockProcess = createMockChildProcess({ stdout: '', exitCode: 0, delay: 200 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const resultPromise = invokeCursorAgent({ argv: ['test'] });
+    vi.advanceTimersByTime(150);
+
+    const result = await resultPromise;
+
+    expect(result.isError).toBe(true);
+    expect(result.progressLogFile).toBeDefined();
+
+    // Clean up
+    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should log assistant message deltas without accumulation', async () => {
+    const streamJsonEvents = [
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: 'Hello' }] } }) + '\n',
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: ' world' }] } }) + '\n',
+      JSON.stringify({ type: 'assistant', message: { content: [{ text: '!' }] } }) + '\n',
+    ];
+
+    const mockProcess = createMockChildProcess({ stdout: streamJsonEvents.join(''), exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const onProgress = vi.fn();
+    const result = await invokeCursorAgent({
+      argv: ['test'],
+      output_format: 'text',
+      onProgress
+    });
+
+    expect(result.progressLogFile).toBeDefined();
+    const logContent = fs.readFileSync(result.progressLogFile, 'utf8');
+
+    // Each delta should be logged separately, not accumulated (format: [timestamp] message)
+    expect(logContent).toContain('Hello');
+    expect(logContent).toContain(' world');
+    expect(logContent).toContain('!');
+
+    // Should not see "Hello world!" as a single message (that would indicate accumulation)
+    const progressLines = logContent.split('\n').filter(line => line.includes('Hello') || line.includes(' world') || line.includes('!'));
+    const helloWorldLine = progressLines.find(line => line.includes('Hello') && line.includes('world') && line.includes('!'));
+    expect(helloWorldLine).toBeUndefined();
+
+    // Clean up
+    if (fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+});
+
+describe('Activity log path appending', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete process.env.CURSOR_AGENT_ECHO_PROMPT;
+    delete process.env.DEBUG_CURSOR_MCP;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('should append activity log path to success result content text', async () => {
+    const mockProcess = createMockChildProcess({ stdout: 'test output', exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const result = await invokeCursorAgent({ argv: ['test'], output_format: 'text' });
+
+    expect(result.progressLogFile).toBeDefined();
+    expect(result.content).toBeDefined();
+    expect(result.content[0].type).toBe('text');
+    expect(result.content[0].text).toContain('test output');
+    expect(result.content[0].text).toContain('Sub agent activity log:');
+    expect(result.content[0].text).toContain(result.progressLogFile);
+
+    // Clean up
+    if (fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should append activity log path to error result content text', async () => {
+    const mockProcess = createMockChildProcess({ stdout: 'output', stderr: 'error', exitCode: 1 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const result = await invokeCursorAgent({ argv: ['test'] });
+
+    expect(result.isError).toBe(true);
+    expect(result.progressLogFile).toBeDefined();
+    expect(result.content).toBeDefined();
+    expect(result.content[0].type).toBe('text');
+    expect(result.content[0].text).toContain('cursor-agent exited with code 1');
+    expect(result.content[0].text).toContain('Sub agent activity log:');
+    expect(result.content[0].text).toContain(result.progressLogFile);
+
+    // Clean up
+    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should append activity log path to timeout result content text', async () => {
+    vi.useFakeTimers();
+    process.env.CURSOR_AGENT_TIMEOUT_MS = '100';
+    const mockProcess = createMockChildProcess({ stdout: '', exitCode: 0, delay: 200 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const resultPromise = invokeCursorAgent({ argv: ['test'] });
+    vi.advanceTimersByTime(150);
+
+    const result = await resultPromise;
+
+    expect(result.isError).toBe(true);
+    expect(result.progressLogFile).toBeDefined();
+    expect(result.content).toBeDefined();
+    expect(result.content[0].type).toBe('text');
+    expect(result.content[0].text).toContain('cursor-agent timed out after 100ms');
+    expect(result.content[0].text).toContain('Sub agent activity log:');
+    expect(result.content[0].text).toContain(result.progressLogFile);
+
+    // Clean up
+    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should append activity log path to process error result content text', async () => {
+    const mockProcess = createMockChildProcess({
+      stdout: '',
+      exitCode: 0,
+      shouldError: true,
+      errorMessage: 'Failed to spawn',
+      delay: 10
+    });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const result = await invokeCursorAgent({ argv: ['test'] });
+
+    expect(result.isError).toBe(true);
+    expect(result.progressLogFile).toBeDefined();
+    expect(result.content).toBeDefined();
+    expect(result.content[0].type).toBe('text');
+    expect(result.content[0].text).toContain('Failed to start');
+    expect(result.content[0].text).toContain('Sub agent activity log:');
+    expect(result.content[0].text).toContain(result.progressLogFile);
+
+    // Clean up
+    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should not append activity log path when writeProgressLog fails', async () => {
+    // Mock fs.writeFileSync to throw an error to simulate writeProgressLog failure
+    const originalWriteFileSync = fs.writeFileSync;
+    vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {
+      throw new Error('Cannot write to file');
+    });
+
+    const mockProcess = createMockChildProcess({ stdout: 'test output', exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const result = await invokeCursorAgent({ argv: ['test'] });
+
+    expect(result.progressLogFile).toBeUndefined();
+    expect(result.content).toBeDefined();
+    expect(result.content[0].type).toBe('text');
+    expect(result.content[0].text).toBe('test output');
+    expect(result.content[0].text).not.toContain('Sub agent activity log:');
+
+    // Restore original writeFileSync
+    fs.writeFileSync = originalWriteFileSync;
+  });
+
+  it('should use system temp directory for activity log path', async () => {
+    const mockProcess = createMockChildProcess({ stdout: 'test output', exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const result = await invokeCursorAgent({ argv: ['test'] });
+
+    expect(result.progressLogFile).toBeDefined();
+    const os = require('node:os');
+    const tempDir = os.tmpdir();
+    expect(result.progressLogFile).toMatch(new RegExp(`^${tempDir.replace(/\\/g, '\\\\')}`));
+    expect(result.progressLogFile).toMatch(/cursor-agent-progress-/);
+
+    // Clean up
+    if (fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should format activity log path correctly with newlines', async () => {
+    const mockProcess = createMockChildProcess({ stdout: 'test output', exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const result = await invokeCursorAgent({ argv: ['test'] });
+
+    expect(result.content[0].text).toMatch(/test output\n\nSub agent activity log: /);
+    const parts = result.content[0].text.split('\n\nSub agent activity log: ');
+    expect(parts.length).toBe(2);
+    expect(parts[0]).toBe('test output');
+    expect(parts[1]).toBe(result.progressLogFile);
+
+    // Clean up
+    if (fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+});
+
+describe('Cancellation support', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('should handle cancellation when signal is already aborted', async () => {
+    const abortController = new AbortController();
+    abortController.abort('Test cancellation');
+
+    const result = await invokeCursorAgent({
+      argv: ['test'],
+      signal: abortController.signal,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('cancelled');
+    expect(result.content[0].text).toContain('Sub agent activity log:');
+
+    // Clean up
+    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should kill child process when signal is aborted', async () => {
+    const abortController = new AbortController();
+    const mockProcess = createMockChildProcess({
+      stdout: 'partial output',
+      exitCode: 0,
+      delay: 100,
+    });
+    const killSpy = vi.spyOn(mockProcess, 'kill');
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const promise = invokeCursorAgent({
+      argv: ['test'],
+      signal: abortController.signal,
+    });
+
+    // Abort immediately after process starts (before it completes)
+    // Use a microtask to ensure the process is spawned first
+    await Promise.resolve();
+    abortController.abort('User cancelled');
+
+    const result = await promise;
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('cancelled');
+    expect(killSpy).toHaveBeenCalledWith('SIGKILL');
+  });
+
+  it('should clean up abort listener on completion', async () => {
+    const abortController = new AbortController();
+    const mockProcess = createMockChildProcess({ stdout: 'output', exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const removeEventListenerSpy = vi.spyOn(abortController.signal, 'removeEventListener');
+
+    await invokeCursorAgent({
+      argv: ['test'],
+      signal: abortController.signal,
+    });
+
+    // Verify listener was removed (cleanup was called)
+    // The cleanup function removes the listener, so we check it was called
+    expect(removeEventListenerSpy).toHaveBeenCalled();
+  });
+
+  it('should handle cancellation gracefully without signal', async () => {
+    const mockProcess = createMockChildProcess({ stdout: 'output', exitCode: 0 });
+    vi.mocked(spawn).mockReturnValue(mockProcess);
+
+    const result = await invokeCursorAgent({
+      argv: ['test'],
+      signal: undefined,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain('output');
+    expect(result.content[0].text).toContain('Sub agent activity log:');
+
+    // Clean up
+    if (result.progressLogFile && fs.existsSync(result.progressLogFile)) {
+      fs.unlinkSync(result.progressLogFile);
+    }
+  });
+
+  it('should include cancellation reason in error message', async () => {
+    const abortController = new AbortController();
+    abortController.abort('Custom cancellation reason');
+
+    const result = await invokeCursorAgent({
+      argv: ['test'],
+      signal: abortController.signal,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Custom cancellation reason');
   });
 });
 

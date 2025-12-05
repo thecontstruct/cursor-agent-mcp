@@ -8,6 +8,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { spawn } from 'node:child_process';
 import process from 'node:process';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 
 // Environment variable schemas and validation
 // Helper to parse boolean-like env vars ('1', 'true', 'yes', 'on')
@@ -325,8 +327,9 @@ function resolveExecutable(explicit) {
 * Internal executor that spawns cursor-agent with provided argv and common options.
 * Adds --print and --output-format, handles env/model/force, timeouts and idle kill.
 * Supports progress notifications when onProgress callback is provided.
+* Supports cancellation via AbortSignal.
 */
-async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable, model, force, print = true, onProgress }) {
+async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable, model, force, print = true, onProgress, signal }) {
  const cmd = resolveExecutable(executable);
  const validatedCwd = validateWorkingDirectory(cwd);
  const safeEnv = getSafeEnvironment();
@@ -372,17 +375,43 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
    let out = '';
    let err = '';
    let idleTimer = null;
+   let mainTimer = null;
    let killedByIdle = false;
 
-   // State for stream-json parsing
-   let accumulatedText = '';
-   let toolCount = 0;
-   let partialLine = ''; // Buffer for incomplete JSON lines
+  // State for stream-json parsing
+  let accumulatedText = '';
+  let toolCount = 0;
+  let partialLine = ''; // Buffer for incomplete JSON lines
 
-   const cleanup = () => {
-     if (mainTimer) clearTimeout(mainTimer);
-     if (idleTimer) clearTimeout(idleTimer);
-   };
+  // Arrays to accumulate progress messages and events for logging
+  const progressMessages = [];
+  const events = [];
+
+  // Helper to write progress log to temp file
+  const writeProgressLog = () => {
+    try {
+      const tempDir = os.tmpdir();
+      const filename = `cursor-agent-progress-${Date.now()}-${Math.random().toString(36).slice(2)}.log`;
+      const filePath = path.join(tempDir, filename);
+
+      // Filter to only include PROGRESS messages (exclude EVENT messages)
+      const progressOnly = progressMessages.filter(({ type }) => type === 'PROGRESS');
+      const lines = progressOnly.map(({ timestamp, message }) => {
+        return `[${timestamp}] ${message}`;
+      });
+
+      fs.writeFileSync(filePath, lines.join('\n') + '\n', 'utf8');
+      return filePath;
+    } catch (e) {
+      // Silently ignore file write errors to avoid breaking the main flow
+      if (debugEnv2.DEBUG_CURSOR_MCP) {
+        try {
+          console.error('[cursor-mcp] failed to write progress log:', e);
+        } catch {}
+      }
+      return null;
+    }
+  };
 
    const debugEnv2 = getValidatedEnv();
    if (debugEnv2.DEBUG_CURSOR_MCP) {
@@ -398,114 +427,216 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
    });
    try { child.stdin?.end(); } catch {}
 
+  // Abort handler for cancellation (defined after child is created)
+  const onAbort = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    try { child.kill('SIGKILL'); } catch {}
+    const progressLogFile = writeProgressLog();
+    const reason = signal?.reason || 'Request cancelled';
+    const baseText = `cursor-agent cancelled: ${reason}`;
+    const finalText = progressLogFile ? `${baseText}\n\nSub agent activity log: ${progressLogFile}` : baseText;
+    resolve({
+      content: [{ type: 'text', text: finalText }],
+      isError: true,
+      ...(progressLogFile && { progressLogFile })
+    });
+  };
+
+  const cleanup = () => {
+    if (mainTimer) clearTimeout(mainTimer);
+    if (idleTimer) clearTimeout(idleTimer);
+    if (signal) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  };
+
+  // Check if already aborted before setting up listener
+  if (signal?.aborted) {
+    onAbort();
+    return;
+  }
+
+  // Set up abort listener if signal is provided
+  if (signal) {
+    signal.addEventListener('abort', onAbort);
+  }
+
    const idleEnv = getValidatedEnv();
    const idleMs = idleEnv.CURSOR_AGENT_IDLE_EXIT_MS ?? 0;
-   const scheduleIdleKill = () => {
-     if (!idleMs || idleMs <= 0) return;
-     if (idleTimer) clearTimeout(idleTimer);
-     idleTimer = setTimeout(() => {
-       killedByIdle = true;
-       try { child.kill('SIGKILL'); } catch {}
-     }, idleMs);
-   };
+  const scheduleIdleKill = () => {
+    if (!idleMs || idleMs <= 0) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      killedByIdle = true;
+      try { child.kill('SIGKILL'); } catch {}
+    }, idleMs);
+  };
 
-   // Helper to handle stream-json events
-   const handleStreamEvent = (event) => {
-     if (!onProgress || !event || typeof event !== 'object') return;
+  // Helper to format events as human-readable messages
+  const formatEventMessage = (event) => {
+    if (!event || typeof event !== 'object') return 'Unknown event';
+    const { type, subtype } = event;
 
-     const { type, subtype } = event;
+    switch (type) {
+      case 'system':
+        if (subtype === 'init') {
+          const modelName = event.model || 'unknown';
+          return `System initialized with model: ${modelName}`;
+        }
+        return `System event: ${subtype || 'unknown'}`;
 
-     try {
-       switch (type) {
-         case 'system':
-           if (subtype === 'init') {
-             const modelName = event.model || 'unknown';
-             onProgress({
-               progress: 0,
-               message: `Initializing cursor-agent (model: ${modelName})...`
-             });
-           }
-           break;
+      case 'assistant':
+        return 'Assistant message received';
 
-         case 'assistant':
-           // Accumulate text deltas from streaming output
-           const text = event.message?.content?.[0]?.text || '';
-           if (text) {
-             accumulatedText += text;
-             onProgress({
-               progress: accumulatedText.length,
-               message: `Generating response... (${accumulatedText.length} characters)`
-             });
-           }
-           break;
+      case 'tool_call':
+        if (subtype === 'started') {
+          const toolCall = event.tool_call;
+          if (toolCall?.writeToolCall) {
+            const filePath = toolCall.writeToolCall?.args?.path || 'unknown';
+            return `Tool call started: writeToolCall(path: ${filePath})`;
+          } else if (toolCall?.readToolCall) {
+            const filePath = toolCall.readToolCall?.args?.path || 'unknown';
+            return `Tool call started: readToolCall(path: ${filePath})`;
+          } else {
+            return `Tool call started: ${toolCall?.name || 'unknown'}`;
+          }
+        } else if (subtype === 'completed') {
+          const toolCall = event.tool_call;
+          if (toolCall?.writeToolCall?.result?.success) {
+            const { linesCreated, fileSize } = toolCall.writeToolCall.result.success;
+            return `Tool call completed: writeToolCall (${linesCreated || 0} lines, ${fileSize || 0} bytes)`;
+          } else if (toolCall?.readToolCall?.result?.success) {
+            const { totalLines } = toolCall.readToolCall.result.success;
+            return `Tool call completed: readToolCall (${totalLines || 0} lines)`;
+          } else {
+            return `Tool call completed: ${toolCall?.name || 'unknown'}`;
+          }
+        }
+        return `Tool call: ${subtype || 'unknown'}`;
 
-         case 'tool_call':
-           if (subtype === 'started') {
-             toolCount++;
-             const toolCall = event.tool_call;
+      case 'result':
+        const duration = event.duration_ms || 0;
+        return `Result: completed in ${duration}ms`;
 
-             if (toolCall?.writeToolCall) {
-               const path = toolCall.writeToolCall?.args?.path || 'unknown';
-               onProgress({
-                 progress: toolCount,
-                 message: `Writing file: ${path}`
-               });
-             } else if (toolCall?.readToolCall) {
-               const path = toolCall.readToolCall?.args?.path || 'unknown';
-               onProgress({
-                 progress: toolCount,
-                 message: `Reading file: ${path}`
-               });
-             } else {
-               // Generic tool call
-               onProgress({
-                 progress: toolCount,
-                 message: `Executing tool #${toolCount}...`
-               });
-             }
-           } else if (subtype === 'completed') {
-             const toolCall = event.tool_call;
+      default:
+        return `Event: ${type}${subtype ? ` (${subtype})` : ''}`;
+    }
+  };
 
-             if (toolCall?.writeToolCall?.result?.success) {
-               const { linesCreated, fileSize } = toolCall.writeToolCall.result.success;
-               onProgress({
-                 progress: toolCount,
-                 message: `✅ Created ${linesCreated || 0} lines (${fileSize || 0} bytes)`
-               });
-             } else if (toolCall?.readToolCall?.result?.success) {
-               const { totalLines } = toolCall.readToolCall.result.success;
-               onProgress({
-                 progress: toolCount,
-                 message: `✅ Read ${totalLines || 0} lines`
-               });
-             } else if (toolCall?.writeToolCall?.result || toolCall?.readToolCall?.result) {
-               // Tool completed but might have error - still report completion
-               onProgress({
-                 progress: toolCount,
-                 message: `✅ Tool #${toolCount} completed`
-               });
-             }
-           }
-           break;
+  // Helper to handle stream-json events
+  const handleStreamEvent = (event) => {
+    if (!event || typeof event !== 'object') return;
 
-         case 'result':
-           const duration = event.duration_ms || 0;
-           onProgress({
-             progress: 100,
-             total: 100,
-             message: `Completed in ${duration}ms`
-           });
-           break;
-       }
-     } catch (e) {
-       // Silently ignore errors in progress handling to avoid breaking the main flow
-       if (debugEnv2.DEBUG_CURSOR_MCP) {
-         try {
-           console.error('[cursor-mcp] progress error:', e);
-         } catch {}
-       }
-     }
-   };
+    const { type, subtype } = event;
+    const timestamp = new Date().toISOString();
+
+    // Store raw event for logging
+    events.push(event);
+
+    try {
+      switch (type) {
+        case 'system':
+          if (subtype === 'init') {
+            const modelName = event.model || 'unknown';
+            const progressMsg = `Initializing cursor-agent (model: ${modelName})...`;
+            progressMessages.push({ timestamp, type: 'PROGRESS', message: progressMsg });
+            if (onProgress) {
+              onProgress({
+                progress: 0,
+                message: progressMsg
+              });
+            }
+          }
+          break;
+
+        case 'assistant':
+          // Accumulate text deltas from streaming output
+          const text = event.message?.content?.[0]?.text || '';
+          if (text) {
+            // Log the delta directly (not accumulated) for the log file
+            progressMessages.push({ timestamp, type: 'PROGRESS', message: text });
+            // Continue accumulating for onProgress callback
+            accumulatedText += text;
+            if (onProgress) {
+              onProgress({
+                progress: accumulatedText.length,
+                message: `Generating response... (${accumulatedText.length} characters)`
+              });
+            }
+          }
+          break;
+
+        case 'tool_call':
+          if (subtype === 'started') {
+            toolCount++;
+            const toolCall = event.tool_call;
+
+            let progressMsg = '';
+            if (toolCall?.writeToolCall) {
+              const path = toolCall.writeToolCall?.args?.path || 'unknown';
+              progressMsg = `Writing file: ${path}`;
+            } else if (toolCall?.readToolCall) {
+              const path = toolCall.readToolCall?.args?.path || 'unknown';
+              progressMsg = `Reading file: ${path}`;
+            } else {
+              progressMsg = `Executing tool #${toolCount}...`;
+            }
+            progressMessages.push({ timestamp, type: 'PROGRESS', message: progressMsg });
+            if (onProgress) {
+              onProgress({
+                progress: toolCount,
+                message: progressMsg
+              });
+            }
+          } else if (subtype === 'completed') {
+            const toolCall = event.tool_call;
+
+            let progressMsg = '';
+            if (toolCall?.writeToolCall?.result?.success) {
+              const { linesCreated, fileSize } = toolCall.writeToolCall.result.success;
+              progressMsg = `✅ Created ${linesCreated || 0} lines (${fileSize || 0} bytes)`;
+            } else if (toolCall?.readToolCall?.result?.success) {
+              const { totalLines } = toolCall.readToolCall.result.success;
+              progressMsg = `✅ Read ${totalLines || 0} lines`;
+            } else if (toolCall?.writeToolCall?.result || toolCall?.readToolCall?.result) {
+              progressMsg = `✅ Tool #${toolCount} completed`;
+            }
+            if (progressMsg) {
+              progressMessages.push({ timestamp, type: 'PROGRESS', message: progressMsg });
+              if (onProgress) {
+                onProgress({
+                  progress: toolCount,
+                  message: progressMsg
+                });
+              }
+            }
+          }
+          break;
+
+        case 'result':
+          const duration = event.duration_ms || 0;
+          const resultProgressMsg = `Completed in ${duration}ms`;
+          progressMessages.push({ timestamp, type: 'PROGRESS', message: resultProgressMsg });
+          if (onProgress) {
+            onProgress({
+              progress: 100,
+              total: 100,
+              message: resultProgressMsg
+            });
+          }
+          break;
+      }
+    } catch (e) {
+      // Silently ignore errors in progress handling to avoid breaking the main flow
+      if (debugEnv2.DEBUG_CURSOR_MCP) {
+        try {
+          console.error('[cursor-mcp] progress error:', e);
+        } catch {}
+      }
+    }
+  };
 
    child.stdout.on('data', (d) => {
      const chunk = d.toString();
@@ -537,13 +668,16 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
            }
          }
        }
-     } else if (onProgress) {
-       // Simple progress for non-streaming formats
-       onProgress({
-         progress: out.length,
-         message: `Received ${out.length} bytes of output...`
-       });
-     }
+    } else if (onProgress) {
+      // Simple progress for non-streaming formats
+      const timestamp = new Date().toISOString();
+      const progressMsg = `Received ${out.length} bytes of output...`;
+      progressMessages.push({ timestamp, type: 'PROGRESS', message: progressMsg });
+      onProgress({
+        progress: out.length,
+        message: progressMsg
+      });
+    }
    });
 
    child.stderr.on('data', (d) => {
@@ -552,34 +686,44 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
      // It will be included in the final result if there's an error
    });
 
-   child.on('error', (e) => {
-     if (settled) return;
-     settled = true;
-     cleanup();
-     const errorEnv = getValidatedEnv();
-     if (errorEnv.DEBUG_CURSOR_MCP) {
-       try { console.error('[cursor-mcp] error:', e); } catch {}
-     }
-     const msg =
-       `Failed to start "${cmd}": ${e?.message || e}\n` +
-       `Args: ${JSON.stringify(finalArgv)}\n` +
-       (safeEnv.CURSOR_AGENT_PATH ? `CURSOR_AGENT_PATH=${safeEnv.CURSOR_AGENT_PATH}\n` : '');
-     resolve({ content: [{ type: 'text', text: msg }], isError: true });
-   });
+  child.on('error', (e) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    const errorEnv = getValidatedEnv();
+    if (errorEnv.DEBUG_CURSOR_MCP) {
+      try { console.error('[cursor-mcp] error:', e); } catch {}
+    }
+    const msg =
+      `Failed to start "${cmd}": ${e?.message || e}\n` +
+      `Args: ${JSON.stringify(finalArgv)}\n` +
+      (safeEnv.CURSOR_AGENT_PATH ? `CURSOR_AGENT_PATH=${safeEnv.CURSOR_AGENT_PATH}\n` : '');
+    const progressLogFile = writeProgressLog();
+    const finalText = progressLogFile ? `${msg}\n\nSub agent activity log: ${progressLogFile}` : msg;
+    resolve({
+      content: [{ type: 'text', text: finalText }],
+      isError: true,
+      ...(progressLogFile && { progressLogFile })
+    });
+  });
 
    const defaultTimeout = 30000;
    const timeoutEnv2 = getValidatedEnv();
    const timeoutMs = timeoutEnv2.CURSOR_AGENT_TIMEOUT_MS ?? defaultTimeout;
-   const mainTimer = setTimeout(() => {
-     try { child.kill('SIGKILL'); } catch {}
-     if (settled) return;
-     settled = true;
-     cleanup();
-     resolve({
-       content: [{ type: 'text', text: `cursor-agent timed out after ${timeoutMs}ms` }],
-       isError: true,
-     });
-   }, timeoutMs);
+  mainTimer = setTimeout(() => {
+    try { child.kill('SIGKILL'); } catch {}
+    if (settled) return;
+    settled = true;
+    cleanup();
+    const progressLogFile = writeProgressLog();
+    const baseText = `cursor-agent timed out after ${timeoutMs}ms`;
+    const finalText = progressLogFile ? `${baseText}\n\nSub agent activity log: ${progressLogFile}` : baseText;
+    resolve({
+      content: [{ type: 'text', text: finalText }],
+      isError: true,
+      ...(progressLogFile && { progressLogFile })
+    });
+  }, timeoutMs);
 
    child.on('close', (code) => {
      if (settled) return;
@@ -594,25 +738,34 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
        } catch {}
      }
 
-     const closeEnv = getValidatedEnv();
-     if (closeEnv.DEBUG_CURSOR_MCP) {
-       try { console.error('[cursor-mcp] exit:', code, 'stdout bytes=', out.length, 'stderr bytes=', err.length); } catch {}
-     }
-     if (code === 0 || (killedByIdle && out)) {
-       resolve({ content: [{ type: 'text', text: out || '(no output)' }] });
-     } else {
-       resolve({
-         content: [{ type: 'text', text: `cursor-agent exited with code ${code}\n${err || out || '(no output)'}` }],
-         isError: true,
-       });
-     }
+    const closeEnv = getValidatedEnv();
+    if (closeEnv.DEBUG_CURSOR_MCP) {
+      try { console.error('[cursor-mcp] exit:', code, 'stdout bytes=', out.length, 'stderr bytes=', err.length); } catch {}
+    }
+    const progressLogFile = writeProgressLog();
+    if (code === 0 || (killedByIdle && out)) {
+      const baseText = out || '(no output)';
+      const finalText = progressLogFile ? `${baseText}\n\nSub agent activity log: ${progressLogFile}` : baseText;
+      resolve({
+        content: [{ type: 'text', text: finalText }],
+        ...(progressLogFile && { progressLogFile })
+      });
+    } else {
+      const baseText = `cursor-agent exited with code ${code}\n${err || out || '(no output)'}`;
+      const finalText = progressLogFile ? `${baseText}\n\nSub agent activity log: ${progressLogFile}` : baseText;
+      resolve({
+        content: [{ type: 'text', text: finalText }],
+        isError: true,
+        ...(progressLogFile && { progressLogFile })
+      });
+    }
    });
  });
 }
 
 // Back-compat: single-shot run by prompt as positional argument.
 // Accepts either a flat args object or an object with an "arguments" field (some hosts).
-async function runCursorAgent(input, onProgress) {
+async function runCursorAgent(input, onProgress, signal) {
   const source = (input && typeof input === 'object' && input.arguments && typeof input.prompt === 'undefined')
     ? input.arguments
     : input;
@@ -642,7 +795,7 @@ async function runCursorAgent(input, onProgress) {
     } catch {}
   }
 
-  const result = await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, onProgress });
+  const result = await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, onProgress, signal });
 
   // Echo prompt either when env is set or when caller provided echo_prompt: true (if host forwards unknown args it's fine)
   const echoEnv = getValidatedEnv();
@@ -795,7 +948,8 @@ server.tool(
       };
 
       const onProgress = createProgressCallback(extra);
-      return await runCursorAgent(flat, onProgress);
+      const signal = extra?.signal;
+      return await runCursorAgent(flat, onProgress, signal);
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -812,7 +966,8 @@ server.tool(
      const { argv, output_format, cwd, executable, model, force } = args;
      // For raw calls we disable implicit --print to allow commands like "--help"
      const onProgress = createProgressCallback(extra);
-     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false, onProgress });
+     const signal = extra?.signal;
+     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false, onProgress, signal });
    } catch (e) {
      return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
    }
@@ -837,7 +992,8 @@ if (executingClient !== 'cursor') {
           (dry_run ? `- Treat as dry-run; do not write to disk.\n` : ``) +
           (prompt ? `- Additional context: ${String(prompt)}\n` : ``);
         const onProgress = createProgressCallback(extra);
-        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress);
+        const signal = extra?.signal;
+        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress, signal);
       } catch (e) {
         return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
       }
@@ -858,7 +1014,8 @@ if (executingClient !== 'cursor') {
           validatedPaths.map((p) => `- ${String(p)}`).join('\n') + '\n' +
           (prompt ? `Additional prompt: ${String(prompt)}\n` : '');
         const onProgress = createProgressCallback(extra);
-        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress);
+        const signal = extra?.signal;
+        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress, signal);
       } catch (e) {
         return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
       }
@@ -881,7 +1038,8 @@ if (executingClient !== 'cursor') {
           (exc.length ? `- Exclude globs:\n${exc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
           `Return concise findings with file paths and line references.`;
         const onProgress = createProgressCallback(extra);
-        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress);
+        const signal = extra?.signal;
+        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress, signal);
       } catch (e) {
         return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
       }
@@ -902,7 +1060,8 @@ if (executingClient !== 'cursor') {
           (cons.length ? `- Constraints:\n${cons.map((c)=>`  - ${String(c)}`).join('\n')}\n` : '') +
           `Provide a numbered list of actions.`;
         const onProgress = createProgressCallback(extra);
-        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress);
+        const signal = extra?.signal;
+        return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force }, onProgress, signal);
       } catch (e) {
         return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
       }
@@ -917,7 +1076,8 @@ if (executingClient !== 'cursor') {
    async (args, extra) => {
      try {
        const onProgress = createProgressCallback(extra);
-       return await runCursorAgent(args, onProgress);
+       const signal = extra?.signal;
+       return await runCursorAgent(args, onProgress, signal);
      } catch (e) {
        return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
      }
